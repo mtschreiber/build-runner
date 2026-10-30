@@ -1,0 +1,309 @@
+# .github/workflows/build.yml
+# Required repo variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   UPSTREAM_REPO  owner/repo to build
+#   BUNDLE_ID      keep constant forever
+# Optional (paid Apple Developer Program only): ENABLE_PAID_SIGNING=true plus secrets
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8, APPLE_TEAM_ID
+# Repo settings -> Actions -> Workflow permissions: Read and write.
+
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream branch, tag or commit SHA to build"
+        default: main
+        required: true
+      force:
+        description: "Rebuild even if a release for this commit already exists"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 11 * * *" # daily, ~6:23 AM Central; only builds when upstream changed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+  BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+  APP_DISPLAY_NAME: ${{ vars.APP_DISPLAY_NAME || 'App' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Resolve the upstream commit and skip if we already shipped it (cheap, Linux)
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.upstream_ref || 'main' }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          : "${UPSTREAM_REPO:?Set the UPSTREAM_REPO repo variable}"
+          : "${BUNDLE_ID:?Set the BUNDLE_ID repo variable}"
+          SHA=$(gh api "repos/$UPSTREAM_REPO/commits/$REF" --jq .sha)
+          SHORT=${SHA:0:7}
+          TAG="build-$SHORT"
+          SHOULD=true
+          if [ "$FORCE" != "true" ] && gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            SHOULD=false
+            echo "::notice::Release $TAG already exists - upstream unchanged, skipping build."
+          fi
+          {
+            echo "sha=$SHA"; echo "short=$SHORT"; echo "tag=$TAG"; echo "should_build=$SHOULD"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build Rust core → xcframework → xcodegen project → unsigned device .app → IPA
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      SRC: ${{ github.workspace }}/src
+      DERIVED: ${{ github.workspace }}/dd
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out upstream @ ${{ needs.check.outputs.short }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Rust toolchain + iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustc --version
+
+      # Cache A: the finished xcframework + generated UniFFI bindings. Keyed on every
+      # input that can change them; on a hit the whole Rust build is skipped.
+      - name: Cache core xcframework
+        id: xcf-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/apps/ios/OuraCore.xcframework
+            src/apps/ios/generated
+          key: xcf-v1-${{ runner.os }}-${{ hashFiles('src/Cargo.lock', 'src/Cargo.toml', 'src/crates/**', 'src/vendor/**', 'src/apps/ios/build-xcframework.sh') }}
+
+      # Cache B: cargo registry/git deps (incl. pinned git deps) + target/.
+      # Only used when Cache A misses, so incremental Rust rebuilds stay fast.
+      - name: Cache cargo
+        if: steps.xcf-cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src -> target
+          cache-targets: true
+          shared-key: ios-core
+
+      - name: Build Rust core xcframework (upstream script)
+        if: steps.xcf-cache.outputs.cache-hit != 'true'
+        run: bash "$SRC/apps/ios/build-xcframework.sh"
+
+      - name: Install xcodegen
+        run: command -v xcodegen >/dev/null || brew install xcodegen
+
+      - name: Generate model-free Xcode project
+        working-directory: src/apps/ios/OuraApp
+        run: xcodegen generate --spec project-ci.yml
+
+      - name: Read version
+        id: ver
+        working-directory: src/apps/ios/OuraApp
+        run: |
+          MV=$(sed -n 's/^ *MARKETING_VERSION: *"\(.*\)"/\1/p' project-ci.yml | head -1)
+          # monotonic build number so sideloaders always see a newer build
+          BN=$((1000 + ${{ github.run_number }}))
+          echo "marketing=${MV:-0.0.0}" >> "$GITHUB_OUTPUT"
+          echo "build=$BN" >> "$GITHUB_OUTPUT"
+
+      - name: xcodebuild (device, Release, unsigned)
+        working-directory: src/apps/ios/OuraApp
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project OuraApp.xcodeproj -scheme OuraApp \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
+            DEVELOPMENT_TEAM="" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E '^(\*\*|error:|warning: .*error)|BUILD' || true
+          test -d "$DERIVED/Build/Products/Release-iphoneos/OuraApp.app" \
+            || { echo "::error::Build failed - see xcodebuild log artifact"; exit 1; }
+
+      # Unsigned binaries carry no entitlements, so sideloaders would silently drop
+      # HealthKit. An ad-hoc signature embeds them; the sideloader then re-signs with
+      # your Apple ID and keeps whatever your account is allowed to have.
+      - name: Package IPA (ad-hoc sign to embed entitlements)
+        id: pkg
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT/Payload"
+          cp -R "$DERIVED/Build/Products/Release-iphoneos/OuraApp.app" "$OUT/Payload/"
+          codesign --force --sign - --timestamp=none \
+            --entitlements "$SRC/apps/ios/OuraApp/OuraApp.entitlements" \
+            "$OUT/Payload/OuraApp.app"
+          codesign -d --entitlements - "$OUT/Payload/OuraApp.app" || true
+          IPA="app-${{ steps.ver.outputs.build }}.ipa"
+          (cd "$OUT" && zip -qry "$IPA" Payload)
+          echo "ipa=$OUT/$IPA" >> "$GITHUB_OUTPUT"
+          echo "ipa_name=$IPA" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -f%z "$OUT/$IPA")" >> "$GITHUB_OUTPUT"
+          cp "$SRC/apps/ios/OuraApp/Assets.xcassets/AppIcon.appiconset/icon-1024.png" "$OUT/icon.png"
+
+      # AltStore/SideStore "source": add its URL once on the phone and the app shows
+      # up with an Update button whenever this workflow publishes a new build.
+      - name: Write AltStore/SideStore source.json
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          IPA_NAME: ${{ steps.pkg.outputs.ipa_name }}
+          SIZE: ${{ steps.pkg.outputs.size }}
+          MARKETING: ${{ steps.ver.outputs.marketing }}
+          BUILD: ${{ steps.ver.outputs.build }}
+          SHORT: ${{ needs.check.outputs.short }}
+        run: |
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          jq -n \
+            --arg name "Personal builds" \
+            --arg id "io.github.$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]').builds" \
+            --arg src "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/source.json" \
+            --arg bundle "$BUNDLE_ID" \
+            --arg ver "$MARKETING" --arg build "$BUILD" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg url "$BASE/$IPA_NAME" --arg icon "$BASE/icon.png" \
+            --arg desc "Build $BUILD ($SHORT)" \
+            --argjson size "$SIZE" --arg appname "$APP_DISPLAY_NAME" \
+            '{name:$name, identifier:$id, sourceURL:$src, apps:[{
+                name:$appname, bundleIdentifier:$bundle, developerName:"CI",
+                localizedDescription:"Personal build.",
+                iconURL:$icon, tintColor:"#5B6CFF",
+                versions:[{version:$ver, buildVersion:$build, date:$date,
+                           localizedDescription:$desc, downloadURL:$url, size:$size,
+                           minOSVersion:"17.0"}]
+              }], news:[]}' > "$RUNNER_TEMP/out/source.json"
+          cat "$RUNNER_TEMP/out/source.json"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          SHA: ${{ needs.check.outputs.sha }}
+          MARKETING: ${{ steps.ver.outputs.marketing }}
+          BUILD: ${{ steps.ver.outputs.build }}
+        run: |
+          OUT="$RUNNER_TEMP/out"
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          NOTES="Version $MARKETING, build $BUILD, upstream commit ${SHA:0:12}."
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --latest \
+            --title "Build $BUILD" \
+            --notes "$NOTES" \
+            "$OUT"/*.ipa "$OUT/source.json" "$OUT/icon.png"
+
+  # ---------------------------------------------------------------------------
+  # 3. OPTIONAL: properly signed build, only if you join the paid Developer Program.
+  #    Uses an App Store Connect API key with automatic provisioning - no Mac,
+  #    no certificates to juggle. Off unless repo variable ENABLE_PAID_SIGNING=true.
+  #    (fastlane match is unnecessary for a single personal app.)
+  # ---------------------------------------------------------------------------
+  signed:
+    needs: [check, build]
+    if: vars.ENABLE_PAID_SIGNING == 'true' && needs.check.outputs.should_build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      SRC: ${{ github.workspace }}/src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            src/apps/ios/OuraCore.xcframework
+            src/apps/ios/generated
+          key: xcf-v1-${{ runner.os }}-${{ hashFiles('src/Cargo.lock', 'src/Cargo.toml', 'src/crates/**', 'src/vendor/**', 'src/apps/ios/build-xcframework.sh') }}
+          fail-on-cache-miss: true
+      - name: Project
+        working-directory: src/apps/ios/OuraApp
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate --spec project-ci.yml
+      - name: Archive + export (development, auto-provisioned via ASC API key)
+        working-directory: src/apps/ios/OuraApp
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"; printf '%s' "$ASC_KEY_P8" > "$KEY"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY"
+                -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          xcodebuild -project OuraApp.xcodeproj -scheme OuraApp -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/OuraApp.xcarchive" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic "${AUTH[@]}" archive
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>debugging</string>
+            <key>teamID</key><string>$TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/OuraApp.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}"
+          rm -f "$KEY"
+      - name: Attach signed IPA to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "$RUNNER_TEMP"/export/*.ipa "$RUNNER_TEMP/app-signed.ipa"
+          gh release upload "${{ needs.check.outputs.tag }}" "$RUNNER_TEMP/app-signed.ipa" \
+            -R "$GITHUB_REPOSITORY" --clobber
